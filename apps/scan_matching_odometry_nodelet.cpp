@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 #include <memory>
 #include <iostream>
 
@@ -6,11 +8,14 @@
 #include <ros/duration.h>
 #include <pcl_ros/point_cloud.h>
 #include <tf_conversions/tf_eigen.h>
+#include <tf/transform_listener.h>
 #include <tf/transform_broadcaster.h>
 
 #include <std_msgs/Time.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 
 #include <nodelet/nodelet.h>
 #include <pluginlib/class_list_macros.h>
@@ -21,6 +26,7 @@
 
 #include <hdl_graph_slam/ros_utils.hpp>
 #include <hdl_graph_slam/registrations.hpp>
+#include <hdl_graph_slam/ScanMatchingStatus.h>
 
 namespace hdl_graph_slam {
 
@@ -39,9 +45,17 @@ public:
 
     initialize_params();
 
+    if(private_nh.param<bool>("enable_imu_frontend", false)) {
+      msf_pose_sub = nh.subscribe<geometry_msgs::PoseWithCovarianceStamped>("/msf_core/pose", 1, boost::bind(&ScanMatchingOdometryNodelet::msf_pose_callback, this, _1, false));
+      msf_pose_after_update_sub = nh.subscribe<geometry_msgs::PoseWithCovarianceStamped>("/msf_core/pose_after_update", 1, boost::bind(&ScanMatchingOdometryNodelet::msf_pose_callback, this, _1, true));
+    }
+
     points_sub = nh.subscribe("/filtered_points", 256, &ScanMatchingOdometryNodelet::cloud_callback, this);
     read_until_pub = nh.advertise<std_msgs::Header>("/scan_matching_odometry/read_until", 32);
     odom_pub = nh.advertise<nav_msgs::Odometry>("/odom", 32);
+    trans_pub = nh.advertise<geometry_msgs::TransformStamped>("/scan_matching_odometry/transform", 32);
+    status_pub = private_nh.advertise<ScanMatchingStatus>("/scan_matching_odometry/status", 8);
+    aligned_points_pub = nh.advertise<sensor_msgs::PointCloud2>("/aligned_points", 32);
   }
 
 private:
@@ -52,6 +66,7 @@ private:
     auto& pnh = private_nh;
     points_topic = pnh.param<std::string>("points_topic", "/velodyne_points");
     odom_frame_id = pnh.param<std::string>("odom_frame_id", "odom");
+    robot_odom_frame_id = pnh.param<std::string>("robot_odom_frame_id", "robot_odom");
 
     // The minimum tranlational distance and rotation angle between keyframes.
     // If this value is zero, frames are always compared with the previous frame
@@ -80,7 +95,7 @@ private:
     } else {
       if(downsample_method != "NONE") {
         std::cerr << "warning: unknown downsampling type (" << downsample_method << ")" << std::endl;
-        std::cerr << "       : use passthrough filter" <<std::endl;
+        std::cerr << "       : use passthrough filter" << std::endl;
       }
       std::cout << "downsample: NONE" << std::endl;
       boost::shared_ptr<pcl::PassThrough<PointT>> passthrough(new pcl::PassThrough<PointT>());
@@ -113,7 +128,14 @@ private:
 
     read_until->frame_id = "/filtered_points";
     read_until_pub.publish(read_until);
+  }
 
+  void msf_pose_callback(const geometry_msgs::PoseWithCovarianceStampedConstPtr& pose_msg, bool after_update) {
+    if(after_update) {
+      msf_pose_after_update = pose_msg;
+    } else {
+      msf_pose = pose_msg;
+    }
   }
 
   /**
@@ -141,6 +163,7 @@ private:
    */
   Eigen::Matrix4f matching(const ros::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
     if(!keyframe) {
+      prev_time = ros::Time();
       prev_trans.setIdentity();
       keyframe_pose.setIdentity();
       keyframe_stamp = stamp;
@@ -152,8 +175,40 @@ private:
     auto filtered = downsample(cloud);
     registration->setInputSource(filtered);
 
+    std::string msf_source;
+    Eigen::Isometry3f msf_delta = Eigen::Isometry3f::Identity();
+
+    if(private_nh.param<bool>("enable_imu_frontend", false)) {
+      if(msf_pose && msf_pose->header.stamp > keyframe_stamp && msf_pose_after_update && msf_pose_after_update->header.stamp > keyframe_stamp) {
+        Eigen::Isometry3d pose0 = pose2isometry(msf_pose_after_update->pose.pose);
+        Eigen::Isometry3d pose1 = pose2isometry(msf_pose->pose.pose);
+        Eigen::Isometry3d delta = pose0.inverse() * pose1;
+
+        msf_source = "imu";
+        msf_delta = delta.cast<float>();
+      } else {
+        std::cerr << "msf data is too old" << std::endl;
+      }
+    } else if(private_nh.param<bool>("enable_robot_odometry_init_guess", false) && !prev_time.isZero()) {
+      tf::StampedTransform transform;
+      if(tf_listener.waitForTransform(cloud->header.frame_id, stamp, cloud->header.frame_id, prev_time, robot_odom_frame_id, ros::Duration(0))) {
+        tf_listener.lookupTransform(cloud->header.frame_id, stamp, cloud->header.frame_id, prev_time, robot_odom_frame_id, transform);
+      } else if(tf_listener.waitForTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_time, robot_odom_frame_id, ros::Duration(0))) {
+        tf_listener.lookupTransform(cloud->header.frame_id, ros::Time(0), cloud->header.frame_id, prev_time, robot_odom_frame_id, transform);
+      }
+
+      if(transform.stamp_.isZero()) {
+        NODELET_WARN_STREAM("failed to look up transform between " << cloud->header.frame_id << " and " << robot_odom_frame_id);
+      } else {
+        msf_source = "odometry";
+        msf_delta = tf2isometry(transform).cast<float>();
+      }
+    }
+
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-    registration->align(*aligned, prev_trans);
+    registration->align(*aligned, prev_trans * msf_delta.matrix());
+
+    publish_scan_matching_status(stamp, cloud->header.frame_id, aligned, msf_source, msf_delta);
 
     if(!registration->hasConverged()) {
       NODELET_INFO_STREAM("scan matching has not converged!!");
@@ -176,8 +231,8 @@ private:
       }
     }
 
+    prev_time = stamp;
     prev_trans = trans;
-
 
     auto keyframe_trans = matrix2transform(stamp, keyframe_pose, odom_frame_id, "keyframe");
     keyframe_broadcaster.sendTransform(keyframe_trans);
@@ -191,7 +246,15 @@ private:
 
       keyframe_pose = odom;
       keyframe_stamp = stamp;
+      prev_time = stamp;
       prev_trans.setIdentity();
+    }
+
+    if (aligned_points_pub.getNumSubscribers() > 0)
+    {
+      pcl::transformPointCloud (*cloud, *aligned, odom);
+      aligned->header.frame_id=odom_frame_id;
+      aligned_points_pub.publish(aligned);
     }
 
     return odom;
@@ -203,8 +266,11 @@ private:
    * @param pose   odometry pose to be published
    */
   void publish_odometry(const ros::Time& stamp, const std::string& base_frame_id, const Eigen::Matrix4f& pose) {
-    // broadcast the transform over tf
+    // publish transform stamped for IMU integration
     geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, odom_frame_id, base_frame_id);
+    trans_pub.publish(odom_trans);
+
+    // broadcast the transform over tf
     odom_broadcaster.sendTransform(odom_trans);
 
     // publish the transform
@@ -225,6 +291,47 @@ private:
     odom_pub.publish(odom);
   }
 
+  /**
+   * @brief publish scan matching status
+   */
+  void publish_scan_matching_status(const ros::Time& stamp, const std::string& frame_id, pcl::PointCloud<pcl::PointXYZI>::ConstPtr aligned, const std::string& msf_source, const Eigen::Isometry3f& msf_delta) {
+    if(!status_pub.getNumSubscribers()) {
+      return;
+    }
+
+    ScanMatchingStatus status;
+    status.header.frame_id = frame_id;
+    status.header.stamp = stamp;
+    status.has_converged = registration->hasConverged();
+    status.matching_error = registration->getFitnessScore();
+
+    const double max_correspondence_dist = 0.5;
+
+    int num_inliers = 0;
+    std::vector<int> k_indices;
+    std::vector<float> k_sq_dists;
+    for(int i=0; i<aligned->size(); i++) {
+      const auto& pt = aligned->at(i);
+      registration->getSearchMethodTarget()->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+      if(k_sq_dists[0] < max_correspondence_dist * max_correspondence_dist) {
+        num_inliers++;
+      }
+    }
+    status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
+
+    status.relative_pose = isometry2pose(Eigen::Isometry3f(registration->getFinalTransformation()).cast<double>());
+
+    if(!msf_source.empty()) {
+      status.prediction_labels.resize(1);
+      status.prediction_labels[0].data = msf_source;
+
+      status.prediction_errors.resize(1);
+      Eigen::Isometry3f error = Eigen::Isometry3f(registration->getFinalTransformation()).inverse() * msf_delta;
+      status.prediction_errors[0] = isometry2pose(error.cast<double>());
+    }
+
+    status_pub.publish(status);
+  }
 
 private:
   // ROS topics
@@ -232,13 +339,20 @@ private:
   ros::NodeHandle private_nh;
 
   ros::Subscriber points_sub;
+  ros::Subscriber msf_pose_sub;
+  ros::Subscriber msf_pose_after_update_sub;
 
   ros::Publisher odom_pub;
+  ros::Publisher trans_pub;
+  ros::Publisher aligned_points_pub;
+  ros::Publisher status_pub;
+  tf::TransformListener tf_listener;
   tf::TransformBroadcaster odom_broadcaster;
   tf::TransformBroadcaster keyframe_broadcaster;
 
   std::string points_topic;
   std::string odom_frame_id;
+  std::string robot_odom_frame_id;
   ros::Publisher read_until_pub;
 
   // keyframe parameters
@@ -252,6 +366,10 @@ private:
   double max_acceptable_angle;
 
   // odometry calculation
+  geometry_msgs::PoseWithCovarianceStampedConstPtr msf_pose;
+  geometry_msgs::PoseWithCovarianceStampedConstPtr msf_pose_after_update;
+
+  ros::Time prev_time;
   Eigen::Matrix4f prev_trans;                  // previous estimated transform from keyframe
   Eigen::Matrix4f keyframe_pose;               // keyframe pose
   ros::Time keyframe_stamp;                    // keyframe time
@@ -262,6 +380,6 @@ private:
   pcl::Registration<PointT, PointT>::Ptr registration;
 };
 
-}
+}  // namespace hdl_graph_slam
 
 PLUGINLIB_EXPORT_CLASS(hdl_graph_slam::ScanMatchingOdometryNodelet, nodelet::Nodelet)
